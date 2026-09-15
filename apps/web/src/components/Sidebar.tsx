@@ -1,12 +1,11 @@
+import { requestCustomSnooze } from "./CustomSnoozeDialog";
 import { useSupportsMultiplePullRequests } from "~/hooks/useSupportsMultiplePullRequests";
-import { useCompactSidebarEnabled } from "../hooks/useSettings";
 import { resolveThreadCurrentPullRequestLink } from "@t3tools/shared/threadPullRequests";
 import { useAtomValue } from "@effect/atom-react";
 import { replaceComposerContextReferences } from "@t3tools/shared/composerContextReferences";
 import * as Schema from "effect/Schema";
 import {
   DndContext,
-  DragOverlay,
   useSensor,
   useSensors,
   type DragEndEvent,
@@ -74,7 +73,6 @@ import {
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
 } from "react";
-import { createPortal } from "react-dom";
 import { useParams, useRouter } from "@tanstack/react-router";
 
 import { useRightPanelStore } from "../rightPanelStore";
@@ -171,6 +169,7 @@ import {
   resolveSidebarThreadStatus,
   searchSidebarThreads,
   shouldCreateNewThreadInCurrentProject,
+  shouldNavigateAfterThreadPark,
   shouldRecedeSidebarThread,
   resolveWorkingStartedAt,
   sidebarListItemId,
@@ -324,7 +323,6 @@ function SidebarThreadTooltip({
   branchMismatch,
   terminalStatus,
   terminalProcessCount,
-  compactStatus,
 }: {
   thread: SidebarThreadSummary;
   project: ProjectFaviconProject | null;
@@ -341,7 +339,6 @@ function SidebarThreadTooltip({
   } | null;
   terminalStatus: TerminalStatusIndicator | null;
   terminalProcessCount: number;
-  compactStatus?: string | undefined;
 }) {
   const driverKind = providerEntry?.driverKind ?? null;
   const supportsMultiplePullRequests = useSupportsMultiplePullRequests(thread.environmentId);
@@ -358,7 +355,6 @@ function SidebarThreadTooltip({
           {thread.title}
         </div>
         <div className="grid gap-1.5 pl-0.5 text-xs text-muted-foreground">
-          {compactStatus ? <div>{compactStatus}</div> : null}
           {projectDisplayName ? (
             <div className="flex min-w-0 items-center gap-2">
               {project ? <ProjectFavicon project={project} className="size-3 shrink-0" /> : null}
@@ -445,7 +441,7 @@ function SidebarThreadTooltip({
 function SnoozePopoverButton(props: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onSnooze: (preset: SnoozePreset) => void;
+  onSnooze: (preset: Pick<SnoozePreset, "snoozedUntil">) => void;
   timestampFormat: TimestampFormat;
 }) {
   const { open, onOpenChange, onSnooze, timestampFormat } = props;
@@ -495,6 +491,19 @@ function SnoozePopoverButton(props: {
             </span>
           </button>
         ))}
+        <div className="my-1 border-t border-border/60" />
+        <button
+          type="button"
+          className="flex w-full cursor-pointer rounded-md px-2 py-1.5 text-left text-xs text-foreground/90 hover:bg-accent hover:text-foreground"
+          onClick={async (event) => {
+            event.stopPropagation();
+            onOpenChange(false);
+            const choice = await requestCustomSnooze();
+            if (choice) onSnooze(choice);
+          }}
+        >
+          Custom…
+        </button>
       </PopoverPopup>
     </Popover>
   );
@@ -508,7 +517,7 @@ function SnoozePopoverButton(props: {
 type SortableThreadRowBag = Pick<
   ReturnType<typeof useSortable>,
   "listeners" | "setNodeRef" | "transform" | "transition" | "isDragging"
-> & { hidden?: boolean };
+>;
 
 function SortableThreadRow(props: {
   id: string;
@@ -589,18 +598,7 @@ function SidebarSectionPlaceholder(props: {
             props.isDropTarget && "border-primary/40 bg-primary/5 text-primary",
           )}
         >
-          <span className="group-data-[collapsible=icon]:sr-only">{props.label}</span>
-          {props.marker === "settled-placeholder" ? (
-            <CheckIcon
-              aria-hidden
-              className="hidden size-3.5 group-data-[collapsible=icon]:block"
-            />
-          ) : (
-            <Undo2Icon
-              aria-hidden
-              className="hidden size-3.5 group-data-[collapsible=icon]:block"
-            />
-          )}
+          {props.label}
         </div>
       ) : null}
     </SortableSidebarMarker>
@@ -624,30 +622,19 @@ function SidebarDragBoundary(props: {
       className="pointer-events-none relative mx-0.5 -mb-px h-0"
     >
       {props.visible ? (
-        <div className="sidebar-drag-boundary-label absolute inset-x-2 top-1 flex h-4 items-center gap-2 group-data-[collapsible=icon]:inset-x-0 group-data-[collapsible=icon]:justify-center">
+        <div className="sidebar-drag-boundary-label absolute inset-x-2 top-1 flex h-4 items-center gap-2">
           <span
             className={cn(
               "shrink-0 text-xs font-medium",
               props.isDropTarget ? "text-primary" : "text-sidebar-foreground/80",
             )}
           >
-            <span className="group-data-[collapsible=icon]:sr-only">{props.label}</span>
-            {props.marker === "pinned-header" ? (
-              <PinIcon
-                aria-hidden
-                className="hidden size-3.5 group-data-[collapsible=icon]:block"
-              />
-            ) : (
-              <Undo2Icon
-                aria-hidden
-                className="hidden size-3.5 group-data-[collapsible=icon]:block"
-              />
-            )}
+            {props.label}
           </span>
           <span
             aria-hidden
             className={cn(
-              "h-px flex-1 group-data-[collapsible=icon]:hidden",
+              "h-px flex-1",
               props.isDropTarget ? "bg-primary/50" : "bg-sidebar-foreground/25",
             )}
           />
@@ -668,32 +655,20 @@ function SidebarSectionHeader(props: {
   isDropTarget?: boolean;
   toggle: { expanded: boolean; onToggle: () => void };
 }) {
-  const compactEnabled = useCompactSidebarEnabled();
-  const { state, isMobile } = useSidebar();
-  const compact = compactEnabled && state === "collapsed" && !isMobile;
   const snoozed = props.marker === "snoozed-header";
   const className = cn(
     "flex h-full w-full items-center gap-2 px-2 text-left text-xs font-medium",
-    compact && "justify-center px-0",
     snoozed ? "text-blue-600 dark:text-blue-400" : "text-sidebar-muted-foreground/60",
     props.dragging && "text-sidebar-foreground/80",
     props.isDropTarget && "text-primary",
   );
   const content = (
     <>
-      <span className={compact ? "sr-only" : "shrink-0"}>{props.label}</span>
-      {compact ? (
-        snoozed ? (
-          <AlarmClockIcon aria-hidden className="size-3.5" />
-        ) : (
-          <CheckIcon aria-hidden className="size-3.5" />
-        )
-      ) : null}
+      <span className="shrink-0">{props.label}</span>
       <span
         aria-hidden
         className={cn(
           "h-px min-w-2 flex-1",
-          compact && "hidden",
           snoozed ? "bg-blue-500/20 dark:bg-blue-400/15" : "bg-sidebar-border/60",
           props.dragging && "bg-sidebar-foreground/25",
           props.isDropTarget && "bg-primary/50",
@@ -703,7 +678,6 @@ function SidebarSectionHeader(props: {
         aria-hidden
         className={cn(
           "size-3 shrink-0 transition-transform",
-          compact && "hidden",
           props.toggle.expanded && "rotate-180",
         )}
       />
@@ -715,22 +689,15 @@ function SidebarSectionHeader(props: {
       data-testid={`sidebar-${props.marker}`}
       className={cn("mx-0.5 h-8", props.className)}
     >
-      <Tooltip disabled={!compact}>
-        <TooltipTrigger
-          render={
-            <button
-              type="button"
-              onClick={props.toggle.onToggle}
-              aria-expanded={props.toggle.expanded}
-              data-testid={`sidebar-${snoozed ? "snoozed" : "settled"}-shelf-toggle`}
-              className={cn(className, "cursor-pointer")}
-            />
-          }
-        >
-          {content}
-        </TooltipTrigger>
-        <TooltipPopup side="right">{props.label}</TooltipPopup>
-      </Tooltip>
+      <button
+        type="button"
+        onClick={props.toggle.onToggle}
+        aria-expanded={props.toggle.expanded}
+        data-testid={`sidebar-${snoozed ? "snoozed" : "settled"}-shelf-toggle`}
+        className={cn(className, "cursor-pointer")}
+      >
+        {content}
+      </button>
     </SortableSidebarMarker>
   );
 }
@@ -753,9 +720,6 @@ const SidebarDraftRow = memo(function SidebarDraftRow(props: {
   onDiscard: (draftId: DraftId) => void;
 }) {
   const { composer, draftId, onDiscard, onNavigate, session } = props;
-  const compactEnabled = useCompactSidebarEnabled();
-  const { state, isMobile } = useSidebar();
-  const compact = compactEnabled && state === "collapsed" && !isMobile;
   const promptPreview =
     replaceComposerContextReferences(composer.prompt, (occurrence) => occurrence.label)
       .trim()
@@ -794,34 +758,6 @@ const SidebarDraftRow = memo(function SidebarDraftRow(props: {
     },
     [draftId, onDiscard],
   );
-  if (compact) {
-    return (
-      <li className="list-none">
-        <Tooltip>
-          <TooltipTrigger
-            render={
-              <button
-                type="button"
-                data-testid="sidebar-draft-row"
-                aria-label={`Draft: ${preview}`}
-                onClick={handleActivate}
-                className={cn(
-                  "relative flex h-7 w-full cursor-pointer items-center justify-center rounded-md outline-none hover:bg-sidebar-row-hover focus-visible:ring-2 focus-visible:ring-ring",
-                  props.isActive ? "bg-sidebar-row-active" : draftSurfaceClassName,
-                )}
-              />
-            }
-          >
-            <SquarePenIcon aria-hidden className={cn(draftPenClassName, "size-4")} />
-          </TooltipTrigger>
-          <TooltipPopup side="right" className="max-w-80 whitespace-normal">
-            <div className="font-medium">{props.projectDisplayName}</div>
-            <div>{preview}</div>
-          </TooltipPopup>
-        </Tooltip>
-      </li>
-    );
-  }
   return (
     <li className="list-none py-0.5">
       <div
@@ -1078,7 +1014,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
   onContextMenu: (threadRef: ScopedThreadRef, position: { x: number; y: number }) => void;
   onSettle: (threadRef: ScopedThreadRef) => void;
   onUnsettle: (threadRef: ScopedThreadRef) => void;
-  onSnooze: (threadRef: ScopedThreadRef, preset: SnoozePreset) => void;
+  onSnooze: (threadRef: ScopedThreadRef, preset: Pick<SnoozePreset, "snoozedUntil">) => void;
   onUnsnooze: (threadRef: ScopedThreadRef) => void;
   onUnpin: (threadRef: ScopedThreadRef) => void;
   onAcknowledgeWoke: (threadRef: ScopedThreadRef, visitedAt: string) => void;
@@ -1111,9 +1047,6 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
     variant,
     variantAction,
   } = props;
-  const compactEnabled = useCompactSidebarEnabled();
-  const { state, isMobile } = useSidebar();
-  const compact = compactEnabled && state === "collapsed" && !isMobile;
   const threadRef = useMemo(
     () => scopeThreadRef(thread.environmentId, thread.id),
     [thread.environmentId, thread.id],
@@ -1291,16 +1224,6 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
       branchMismatch={branchMismatch}
       terminalStatus={terminalStatus}
       terminalProcessCount={terminalProcessCount}
-      compactStatus={
-        compact
-          ? (topStatus?.label ??
-            (variantAction === "unsnooze"
-              ? "Snoozed"
-              : variantAction === "unsettle"
-                ? "Settled"
-                : "Ready"))
-          : undefined
-      }
     />
   );
 
@@ -1347,7 +1270,6 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
     [isRenaming, onStartRename, thread.title, threadRef],
   );
   const [isFileDragOver, setIsFileDragOver] = useState(false);
-  const [tooltipOpen, setTooltipOpen] = useState(false);
   const fileDropHandlers = useMemo(
     () =>
       onFileDropThreads
@@ -1426,7 +1348,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
     [onUnpin, threadRef],
   );
   const handleSnoozePreset = useCallback(
-    (preset: SnoozePreset) => {
+    (preset: Pick<SnoozePreset, "snoozedUntil">) => {
       onSnooze(threadRef, preset);
     },
     [onSnooze, threadRef],
@@ -1510,7 +1432,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
           // A zero-height boundary also makes dnd-kit scale the source to
           // zero. Only projected peers use scaleY as a visibility sentinel.
           visibility:
-            sortable.hidden || (!sortable.isDragging && sortable.transform?.scaleY === 0)
+            !sortable.isDragging && sortable.transform?.scaleY === 0
               ? ("hidden" as const)
               : undefined,
         },
@@ -1651,77 +1573,6 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
     )
   ) : null;
 
-  if (compact) {
-    return (
-      <li
-        data-thread-item
-        {...sortableRootProps}
-        {...(fileDropHandlers ?? {})}
-        className={cn("list-none", sortable?.isDragging && "relative z-20")}
-      >
-        <Tooltip
-          open={
-            sortable?.hidden ? false : sortable?.isDragging ? dragDestination !== null : tooltipOpen
-          }
-          onOpenChange={setTooltipOpen}
-        >
-          <TooltipTrigger
-            render={
-              <div
-                ref={rowRef}
-                role="button"
-                tabIndex={0}
-                aria-label={`${thread.title}${topStatus ? `, ${topStatus.label}` : ""}`}
-                aria-current={props.isActive ? "page" : undefined}
-                aria-busy={isRegeneratingTitle || undefined}
-                className={cn(
-                  rowSurfaceClassName,
-                  "flex h-7 items-center justify-center focus-visible:ring-2 focus-visible:ring-ring",
-                )}
-                onClick={handleClick}
-                onDoubleClick={handleDoubleClick}
-                onKeyDown={handleKeyDown}
-                onContextMenu={handleContextMenu}
-              />
-            }
-          >
-            {props.project ? (
-              <ProjectFavicon project={props.project} className="size-4 shrink-0" />
-            ) : driverKind ? (
-              <ProviderInstanceIcon
-                driverKind={driverKind}
-                displayName={providerEntry?.displayName ?? modelInstanceId}
-                iconClassName="size-4"
-              />
-            ) : (
-              <SquarePenIcon aria-hidden className="size-4" />
-            )}
-            {topStatus ? (
-              <span
-                aria-hidden
-                className={cn(
-                  "absolute right-0.5 bottom-0.5 size-1.5 rounded-full bg-current",
-                  topStatus.className,
-                )}
-              />
-            ) : hasUnsentDraft ? (
-              <span
-                aria-hidden
-                className="absolute right-0.5 bottom-0.5 size-1.5 rounded-full bg-primary"
-              />
-            ) : null}
-            {props.jumpLabel ? <JumpHintBadge label={props.jumpLabel} /> : null}
-          </TooltipTrigger>
-          {sortable?.isDragging ? (
-            <TooltipPopup side="right">{dragDestination}</TooltipPopup>
-          ) : (
-            detailsTooltip
-          )}
-        </Tooltip>
-      </li>
-    );
-  }
-
   if (variant === "slim") {
     return (
       <li
@@ -1734,11 +1585,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
           sortable?.isDragging && "relative z-20",
         )}
       >
-        <Tooltip
-          open={!sortable?.isDragging && tooltipOpen}
-          onOpenChange={setTooltipOpen}
-          disabled={sortable?.isDragging}
-        >
+        <Tooltip disabled={sortable?.isDragging}>
           <TooltipTrigger
             render={
               <div
@@ -1891,11 +1738,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
         sortable?.isDragging && "relative z-20",
       )}
     >
-      <Tooltip
-        open={!snoozeMenuOpen && !sortable?.isDragging && tooltipOpen}
-        onOpenChange={setTooltipOpen}
-        disabled={snoozeMenuOpen || sortable?.isDragging}
-      >
+      <Tooltip disabled={snoozeMenuOpen || sortable?.isDragging}>
         <TooltipTrigger
           render={
             <div
@@ -2162,9 +2005,6 @@ const SidebarSearchResultRow = memo(function SidebarSearchResultRow(props: {
   onFileDropThreads: (threadRef: ScopedThreadRef, files: File[]) => void;
 }) {
   const { thread } = props;
-  const compactEnabled = useCompactSidebarEnabled();
-  const { state, isMobile } = useSidebar();
-  const compact = compactEnabled && state === "collapsed" && !isMobile;
   const threadRef = useMemo(
     () => scopeThreadRef(thread.environmentId, thread.id),
     [thread.environmentId, thread.id],
@@ -2250,7 +2090,6 @@ const SidebarSearchResultRow = memo(function SidebarSearchResultRow(props: {
               onClick={props.onSelect}
               className={cn(
                 "flex h-9 w-full cursor-pointer items-center gap-2.5 rounded-md px-2.5 text-left text-sm outline-none",
-                compact && "justify-center px-0",
                 props.isHighlighted || props.isRouteActive
                   ? "bg-sidebar-row-active text-sidebar-foreground"
                   : "text-sidebar-muted-foreground/75 hover:bg-sidebar-row-hover hover:text-sidebar-foreground",
@@ -2262,15 +2101,9 @@ const SidebarSearchResultRow = memo(function SidebarSearchResultRow(props: {
         >
           {props.project ? (
             <ProjectFavicon project={props.project} className="size-4 shrink-0" />
-          ) : compact ? (
-            <SquarePenIcon aria-hidden className="size-4" />
           ) : null}
-          <span className={compact ? "sr-only" : "min-w-0 flex-1 truncate"}>{thread.title}</span>
-          <span
-            className={
-              compact ? "sr-only" : "shrink-0 text-xs text-muted-foreground/55 tabular-nums"
-            }
-          >
+          <span className="min-w-0 flex-1 truncate">{thread.title}</span>
+          <span className="shrink-0 text-xs text-muted-foreground/55 tabular-nums">
             {threadTimeLabel(thread)}
           </span>
         </TooltipTrigger>
@@ -2298,10 +2131,7 @@ export default function Sidebar() {
   const projectOrder = useUiStateStore((store) => store.projectOrder);
   const threads = useThreadShells();
   const router = useRouter();
-  const { isMobile, setOpenMobile, setOpen, state: sidebarState } = useSidebar();
-  const compactEnabled = useCompactSidebarEnabled();
-  const compact = compactEnabled && sidebarState === "collapsed" && !isMobile;
-  const [snoozedFooter, setSnoozedFooter] = useState<HTMLUListElement | null>(null);
+  const { isMobile, setOpenMobile } = useSidebar();
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
   const confirmThreadDelete = useClientSettings((s) => s.confirmThreadDelete);
   const confirmThreadArchive = useClientSettings((s) => s.confirmThreadArchive);
@@ -2873,7 +2703,6 @@ export default function Sidebar() {
     [setSettledShelfExpanded],
   );
   const renderedSettledThreads = useMemo(() => {
-    if (compact) return EMPTY_THREADS;
     if (settledShelfExpanded) return visibleSettledThreads;
     if (routeThreadKey === null) return EMPTY_THREADS;
     const routeThread = visibleSettledThreads.find(
@@ -2881,7 +2710,7 @@ export default function Sidebar() {
         scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)) === routeThreadKey,
     );
     return routeThread === undefined ? EMPTY_THREADS : [routeThread];
-  }, [compact, routeThreadKey, settledShelfExpanded, visibleSettledThreads]);
+  }, [routeThreadKey, settledShelfExpanded, visibleSettledThreads]);
 
   // The snoozed shelf is collapsed by default: out of the way, never gone.
   // Collapsed threads don't render (and so don't participate in jump
@@ -3109,14 +2938,10 @@ export default function Sidebar() {
 
   const [renamingThreadKey, setRenamingThreadKey] = useState<string | null>(null);
   const [renamingTitle, setRenamingTitle] = useState("");
-  const startThreadRename = useCallback(
-    (threadRef: ScopedThreadRef, title: string) => {
-      if (compact) setOpen(true);
-      setRenamingThreadKey(scopedThreadKey(threadRef));
-      setRenamingTitle(title);
-    },
-    [compact, setOpen],
-  );
+  const startThreadRename = useCallback((threadRef: ScopedThreadRef, title: string) => {
+    setRenamingThreadKey(scopedThreadKey(threadRef));
+    setRenamingTitle(title);
+  }, []);
   const cancelThreadRename = useCallback(() => setRenamingThreadKey(null), []);
   const commitThreadRename = useCallback(
     (threadRef: ScopedThreadRef, title: string, originalTitle: string) => {
@@ -3229,7 +3054,15 @@ export default function Sidebar() {
           }
           // Only move forward if the user is still on the settled thread —
           // a navigation made during the await wins over ours.
-          if (routeThreadKeyRef.current === threadKey) {
+          if (
+            shouldNavigateAfterThreadPark({
+              threadKey,
+              currentThreadKey: routeThreadKeyRef.current,
+              action: "settle",
+              now: new Date().toISOString(),
+              thread: readThreadShell(threadRef),
+            })
+          ) {
             navigateAfterSettle?.();
           }
         } finally {
@@ -3278,18 +3111,8 @@ export default function Sidebar() {
   const threadListRef = useRef<HTMLUListElement | null>(null);
   const dragLabelOffsetRef = useRef(0);
   const restrictBelowPins = useCallback<Modifier>(
-    (args) =>
-      restrictBelowSidebarLabel(
-        {
-          ...args,
-          // The fixed snoozed shelf shares the main list's drag boundary.
-          containerNodeRect: compact
-            ? (threadListRef.current?.getBoundingClientRect() ?? args.containerNodeRect)
-            : args.containerNodeRect,
-        },
-        dragLabelOffsetRef.current,
-      ),
-    [compact],
+    (args) => restrictBelowSidebarLabel(args, dragLabelOffsetRef.current),
+    [],
   );
   const listMotionRef = useRef<ReturnType<typeof createSidebarListMotion> | null>(null);
   const attachListMotionRef = useCallback((node: HTMLUListElement | null) => {
@@ -3511,7 +3334,7 @@ export default function Sidebar() {
       pinnedThreads.length +
         activeThreads.length +
         snoozedThreads.length +
-        (compact ? 0 : settledThreads.length) ===
+        settledThreads.length ===
       0
     ) {
       return [];
@@ -3527,15 +3350,13 @@ export default function Sidebar() {
       items.push({ kind: "marker", marker: "snoozed-header" });
       items.push(...rowsOf(visibleSnoozedThreads, "snoozed"));
     }
-    if (!compact) {
-      items.push({ kind: "marker", marker: "settled-header" });
-      items.push({ kind: "marker", marker: "settled-placeholder" });
-      items.push(...rowsOf(renderedSettledThreads, "settled"));
-    }
+    items.push({ kind: "marker", marker: "settled-header" });
+    const settledRows = rowsOf(renderedSettledThreads, "settled");
+    items.push({ kind: "marker", marker: "settled-placeholder" });
+    items.push(...settledRows);
     return items;
   }, [
     activeThreads,
-    compact,
     pinnedThreads,
     renderedSettledThreads,
     settledThreads.length,
@@ -3605,7 +3426,6 @@ export default function Sidebar() {
     () =>
       createSidebarSortingStrategy({
         items: sidebarListItems,
-        compact,
         boundaryLabelHeight: SIDEBAR_DRAG_LABEL_HEIGHT,
         settledOrder: draggedSettledOrder,
         settledExpanded: settledShelfExpanded,
@@ -3614,7 +3434,6 @@ export default function Sidebar() {
         snoozedThreadCount: snoozedThreads.length,
       }),
     [
-      compact,
       draggedSettledOrder,
       routeThreadKey,
       settledShelfExpanded,
@@ -3622,22 +3441,6 @@ export default function Sidebar() {
       sidebarListItems,
       snoozedThreads.length,
     ],
-  );
-  const draggingCompactSnoozed = compact && dragState?.activeSection === "snoozed";
-  const compactSnoozedDragThread =
-    draggingCompactSnoozed && dragState ? threadByKey.get(dragState.activeKey) : undefined;
-  const compactSidebarSortingStrategy = useCallback<typeof sidebarSortingStrategy>(
-    (args) => {
-      const item = sidebarListItems[args.index];
-      // Footer rows stay anchored while the main list previews a reorder.
-      if (
-        item?.kind === "thread" ? item.section === "snoozed" : item?.marker === "snoozed-header"
-      ) {
-        return null;
-      }
-      return sidebarSortingStrategy(args);
-    },
-    [sidebarListItems, sidebarSortingStrategy],
   );
   // Hidden and filtered threads keep their keys. Reserve those slots without
   // including the rows in the visible drop order or writing to them.
@@ -3788,7 +3591,17 @@ export default function Sidebar() {
             const settled = await run(settleThread(threadRef), "Failed to settle thread").finally(
               () => settlingThreadKeysRef.current.delete(activeKey),
             );
-            if (settled && routeThreadKeyRef.current === activeKey) navigateAfterSettle?.();
+            if (
+              settled &&
+              shouldNavigateAfterThreadPark({
+                threadKey: activeKey,
+                currentThreadKey: routeThreadKeyRef.current,
+                action: "settle",
+                now: new Date().toISOString(),
+                thread: readThreadShell(threadRef),
+              })
+            )
+              navigateAfterSettle?.();
             return;
           }
           case "move-active":
@@ -3864,7 +3677,7 @@ export default function Sidebar() {
   const performSnooze = useCallback(
     async (
       threadRef: ScopedThreadRef,
-      preset: SnoozePreset,
+      preset: Pick<SnoozePreset, "snoozedUntil">,
       opts: { coSnoozingKeys?: ReadonlySet<string> } = {},
     ) => {
       const threadKey = scopedThreadKey(threadRef);
@@ -3885,7 +3698,15 @@ export default function Sidebar() {
         }
         // Only move forward if the user is still on the snoozed thread —
         // a navigation made during the await wins over ours.
-        if (routeThreadKeyRef.current === threadKey) {
+        if (
+          shouldNavigateAfterThreadPark({
+            threadKey,
+            currentThreadKey: routeThreadKeyRef.current,
+            action: "snooze",
+            now: new Date().toISOString(),
+            thread: readThreadShell(threadRef),
+          })
+        ) {
           navigateAfterSnooze?.();
         }
         return { status: "success" } as const;
@@ -3898,7 +3719,7 @@ export default function Sidebar() {
   const attemptSnooze = useCallback(
     (
       threadRef: ScopedThreadRef,
-      preset: SnoozePreset,
+      preset: Pick<SnoozePreset, "snoozedUntil">,
       opts: { coSnoozingKeys?: ReadonlySet<string> } = {},
     ) => {
       void (async () => {
@@ -3994,10 +3815,13 @@ export default function Sidebar() {
                   {
                     id: "snooze",
                     label: `Snooze (${count})`,
-                    children: snoozePresets.map((preset) => ({
-                      id: `snooze:${preset.id}`,
-                      label: `${preset.label} (${preset.whenLabel})`,
-                    })),
+                    children: [
+                      ...snoozePresets.map((preset) => ({
+                        id: `snooze:${preset.id}`,
+                        label: `${preset.label} (${preset.whenLabel})`,
+                      })),
+                      { id: "snooze:custom", label: "Custom…", separatorBefore: true },
+                    ],
                   },
                 ]
               : []),
@@ -4010,9 +3834,10 @@ export default function Sidebar() {
       );
       if (clicked._tag === "Failure") return;
       if (clicked.value?.startsWith("snooze:")) {
-        const preset = snoozePresets.find(
-          (candidate) => `snooze:${candidate.id}` === clicked.value,
-        );
+        const preset =
+          clicked.value === "snooze:custom"
+            ? await requestCustomSnooze()
+            : snoozePresets.find((candidate) => `snooze:${candidate.id}` === clicked.value);
         if (preset) {
           // Post-snooze navigation must skip threads snoozing in this same
           // batch — they are all leaving the card block together.
@@ -4239,9 +4064,10 @@ export default function Sidebar() {
         );
         if (clicked._tag === "Failure") return;
         if (clicked.value?.startsWith("snooze:")) {
-          const preset = snoozePresets.find(
-            (candidate) => `snooze:${candidate.id}` === clicked.value,
-          );
+          const preset =
+            clicked.value === "snooze:custom"
+              ? await requestCustomSnooze()
+              : snoozePresets.find((candidate) => `snooze:${candidate.id}` === clicked.value);
           if (preset) attemptSnooze(threadRef, preset);
           return;
         }
@@ -4542,19 +4368,7 @@ export default function Sidebar() {
     <>
       <SidebarChromeHeader isElectron={isElectron} />
       <SidebarContent
-        className={cn(
-          "gap-0",
-          compact ? "group-data-[collapsible=icon]:overflow-visible" : "min-h-full",
-        )}
-        fixedFooter={
-          compact && !isSearchingThreads && snoozedThreads.length > 0 ? (
-            <ul
-              ref={setSnoozedFooter}
-              aria-label="Snoozed threads"
-              className="relative flex max-h-[min(30vh,16rem)] flex-col gap-px overflow-y-auto px-[var(--sidebar-content-inset)] pb-1"
-            />
-          ) : null
-        }
+        className="gap-0 min-h-full"
         fixedHeader={
           // Lifted above the stage backdrop, whose fade bleeds below the
           // header and would otherwise paint across the search row's outline.
@@ -4614,12 +4428,8 @@ export default function Sidebar() {
                     // popup opens under the field, is at least as wide as it,
                     // and grows to fit project names up to a cap, past which
                     // the rows truncate.
-                    anchor={compact ? undefined : headerSearchRef}
-                    side={compact ? "right" : "bottom"}
-                    className={cn(
-                      "max-w-[min(18rem,var(--available-width))] overflow-hidden",
-                      compact && "min-w-56",
-                    )}
+                    anchor={headerSearchRef}
+                    className="max-w-[min(18rem,var(--available-width))] overflow-hidden"
                   >
                     <ComboboxSearchInput
                       aria-label="Search projects"
@@ -4721,12 +4531,7 @@ export default function Sidebar() {
           </SidebarGroup>
         }
       >
-        <SidebarGroup
-          className={cn(
-            "ps-[calc(var(--sidebar-content-inset)+1px)] pe-[var(--sidebar-content-inset)] pb-1 pt-0",
-            !compact && "flex-1",
-          )}
-        >
+        <SidebarGroup className="ps-[calc(var(--sidebar-content-inset)+1px)] pe-[var(--sidebar-content-inset)] pb-1 pt-0 flex-1">
           {isSearchingThreads ? (
             threadSearchResults.length > 0 ? (
               <TooltipProvider
@@ -4779,10 +4584,7 @@ export default function Sidebar() {
             ) : (
               <p
                 role="status"
-                className={cn(
-                  "px-2 py-6 text-center text-xs text-sidebar-muted-foreground",
-                  compact && "sr-only",
-                )}
+                className="px-2 py-6 text-center text-xs text-sidebar-muted-foreground"
               >
                 No threads found
               </p>
@@ -4801,23 +4603,20 @@ export default function Sidebar() {
                 modifiers={[
                   restrictToVerticalAxis,
                   restrictBelowPins,
-                  ...(compact ? [] : [restrictToFirstScrollableAncestor]),
+                  restrictToFirstScrollableAncestor,
                 ]}
                 onDragStart={handleThreadDragStart}
                 onDragOver={handleThreadDragOver}
                 onDragEnd={handleThreadDragEnd}
               >
                 <SidebarDragLifecycle onUnmount={cancelThreadDrag} />
-                <SortableContext
-                  items={sortableIds}
-                  strategy={compact ? compactSidebarSortingStrategy : sidebarSortingStrategy}
-                >
+                <SortableContext items={sortableIds} strategy={sidebarSortingStrategy}>
                   <ul
                     ref={attachListMotionRef}
                     role="list"
                     className={cn(
                       "relative flex flex-col gap-px",
-                      !compact && sidebarListItems.length > 0 && "flex-1",
+                      sidebarListItems.length > 0 && "flex-1",
                     )}
                   >
                     {(() => {
@@ -4944,25 +4743,11 @@ export default function Sidebar() {
                               !draggableThreadKeys.has(threadKey) || optimisticDrop !== null
                             }
                           >
-                            {(bag) =>
-                              renderThreadRowInner(
-                                thread,
-                                section,
-                                draggingCompactSnoozed && bag.isDragging
-                                  ? { ...bag, hidden: true }
-                                  : bag,
-                              )
-                            }
+                            {(bag) => renderThreadRowInner(thread, section, bag)}
                           </SortableThreadRow>
                         );
                       };
                       const from = dragState?.activeSection ?? null;
-                      const showDragLabels =
-                        from !== null &&
-                        (!compact ||
-                          dragTargetSection === "active" ||
-                          dragTargetSection === "pinned");
-                      const snoozedItems: ReactNode[] = [];
                       const items: ReactNode[] = [
                         <SidebarDraftBlock
                           key="draft-sessions"
@@ -4974,17 +4759,8 @@ export default function Sidebar() {
                         />,
                       ];
                       for (const item of sidebarListItems) {
-                        const destination =
-                          compact &&
-                          (item.kind === "thread"
-                            ? item.section === "snoozed"
-                            : item.marker === "snoozed-header")
-                            ? snoozedItems
-                            : items;
                         if (item.kind === "thread") {
-                          destination.push(
-                            renderThreadRow(threadByKey.get(item.key)!, item.section),
-                          );
+                          items.push(renderThreadRow(threadByKey.get(item.key)!, item.section));
                           continue;
                         }
                         switch (item.marker) {
@@ -4994,7 +4770,7 @@ export default function Sidebar() {
                                 key="pinned-header"
                                 marker="pinned-header"
                                 label="Pinned"
-                                visible={showDragLabels}
+                                visible={from !== null}
                                 isDropTarget={dragTargetSection === "pinned"}
                               />,
                             );
@@ -5005,7 +4781,7 @@ export default function Sidebar() {
                                 key="pinned-divider"
                                 marker="pinned-divider"
                                 label="Active"
-                                visible={showDragLabels}
+                                visible={from !== null}
                                 isDropTarget={dragTargetSection === "active"}
                               />,
                             );
@@ -5029,11 +4805,11 @@ export default function Sidebar() {
                             );
                             break;
                           case "snoozed-header":
-                            destination.push(
+                            items.push(
                               <SidebarSectionHeader
                                 key="snoozed-shelf-header"
                                 marker="snoozed-header"
-                                className={cn(!compact && "mt-auto")}
+                                className="mt-auto"
                                 label={
                                   snoozedShelfExpanded
                                     ? "Snoozed"
@@ -5051,7 +4827,7 @@ export default function Sidebar() {
                               <SidebarSectionHeader
                                 key="settled-shelf-header"
                                 marker="settled-header"
-                                className={cn(!compact && snoozedThreads.length === 0 && "mt-auto")}
+                                className={cn(snoozedThreads.length === 0 && "mt-auto")}
                                 label={
                                   settledShelfExpanded
                                     ? "Settled"
@@ -5086,56 +4862,18 @@ export default function Sidebar() {
                             break;
                         }
                       }
-                      // Keep the shelf inside this drag context while anchoring
-                      // its DOM outside the main thread scroller.
-                      return [
-                        ...items,
-                        compact && snoozedFooter
-                          ? createPortal(snoozedItems, snoozedFooter, "snoozed-footer")
-                          : null,
-                        compactSnoozedDragThread
-                          ? createPortal(
-                              <DragOverlay dropAnimation={null}>
-                                <ul className="pointer-events-none">
-                                  {renderThreadRowInner(compactSnoozedDragThread, "snoozed", {
-                                    isDragging: true,
-                                    listeners: undefined,
-                                    setNodeRef: () => {},
-                                    transform: null,
-                                    transition: undefined,
-                                  })}
-                                </ul>
-                              </DragOverlay>,
-                              document.body,
-                              "compact-snoozed-drag",
-                            )
-                          : null,
-                      ];
+                      return items;
                     })()}
-                    {!compact && settledShelfExpanded && hiddenSettledCount > 0 ? (
+                    {settledShelfExpanded && hiddenSettledCount > 0 ? (
                       <li className="list-none">
-                        <Tooltip disabled={!compact}>
-                          <TooltipTrigger
-                            render={
-                              <button
-                                type="button"
-                                onClick={showMoreSettled}
-                                className={cn(
-                                  "flex h-9 w-full cursor-pointer items-center gap-2.5 rounded-md px-2.5 text-left text-sm text-sidebar-muted-foreground/55 hover:bg-sidebar-row-hover hover:text-sidebar-foreground",
-                                  compact && "justify-center px-0",
-                                )}
-                              />
-                            }
-                          >
-                            <PlusIcon aria-hidden className="size-4 shrink-0" />
-                            <span className={compact ? "sr-only" : undefined}>
-                              Show {Math.min(hiddenSettledCount, SETTLED_TAIL_PAGE_COUNT)} more
-                            </span>
-                          </TooltipTrigger>
-                          <TooltipPopup side="right">
-                            Show {Math.min(hiddenSettledCount, SETTLED_TAIL_PAGE_COUNT)} more
-                          </TooltipPopup>
-                        </Tooltip>
+                        <button
+                          type="button"
+                          onClick={showMoreSettled}
+                          className="flex h-9 w-full cursor-pointer items-center gap-2.5 rounded-md px-2.5 text-left text-sm text-sidebar-muted-foreground/55 hover:bg-sidebar-row-hover hover:text-sidebar-foreground"
+                        >
+                          <PlusIcon aria-hidden className="size-4 shrink-0" />
+                          Show {Math.min(hiddenSettledCount, SETTLED_TAIL_PAGE_COUNT)} more
+                        </button>
                       </li>
                     ) : null}
                   </ul>
@@ -5150,29 +4888,20 @@ export default function Sidebar() {
             snoozedThreads.length +
             settledThreads.length ===
             0 ? (
-            <div
-              className={cn(
-                "flex flex-col items-center gap-2 px-2 py-6 text-center text-xs text-muted-foreground/60",
-                compact && "px-0",
-              )}
-            >
+            <div className="flex flex-col items-center gap-2 px-2 py-6 text-center text-xs text-muted-foreground/60">
               {projects.length === 0 ? (
                 <>
-                  <span className={compact ? "sr-only" : undefined}>No projects yet</span>
+                  <span>No projects yet</span>
                   <button
                     type="button"
                     onClick={openAddProjectCommandPalette}
-                    aria-label="Add project"
-                    className={cn(
-                      "inline-flex cursor-pointer items-center gap-1.5 rounded-md border border-sidebar-border px-2.5 py-1 text-[11px] font-medium text-sidebar-muted-foreground transition-colors hover:bg-sidebar-row-hover hover:text-sidebar-foreground",
-                      compact && "justify-center px-1.5",
-                    )}
+                    className="inline-flex cursor-pointer items-center gap-1.5 rounded-md border border-sidebar-border px-2.5 py-1 text-[11px] font-medium text-sidebar-muted-foreground transition-colors hover:bg-sidebar-row-hover hover:text-sidebar-foreground"
                   >
                     <PlusIcon className="-mx-0.5 size-3" />
-                    <span className={compact ? "sr-only" : undefined}>Add project</span>
+                    Add project
                   </button>
                 </>
-              ) : compact ? null : scopedProjectGroup ? (
+              ) : scopedProjectGroup ? (
                 `No threads in ${scopedProjectGroup.displayName} yet`
               ) : (
                 "No threads yet"
