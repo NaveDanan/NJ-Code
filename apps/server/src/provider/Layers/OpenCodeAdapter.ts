@@ -365,6 +365,7 @@ interface OpenCodeSessionContext {
   pendingRequestRecovery: OpenCodePendingRequestRecovery | undefined;
   promptGeneration: number;
   promptAdmission: OpenCodePromptAdmission | undefined;
+  lastAcceptedPrompt: Pick<OpenCodePromptAdmission, "turnId" | "messageId"> | undefined;
   readonly commandFibers: Set<Fiber.Fiber<void, ProviderAdapterRequestError>>;
   readonly promptSemaphore: Semaphore.Semaphore;
   readonly firstConnection: Deferred.Deferred<void, ProviderAdapterRequestError>;
@@ -1134,6 +1135,7 @@ export function makeOpenCodeAdapter(
       }
       const tokenUsage = takeOpenCodeTurnTokenUsage(context, true);
       context.activeTurnId = undefined;
+      context.lastAcceptedPrompt = undefined;
       context.activeAgent = undefined;
       context.activeVariant = undefined;
       context.interruptedTurnId = undefined;
@@ -1424,8 +1426,8 @@ export function makeOpenCodeAdapter(
 
           if (
             promptAdmission.messageObserved &&
-            promptAdmission.idleDuringAdmission === undefined &&
-            promptAdmission.priorIdle === undefined
+            !promptAdmission.busyObserved &&
+            !promptAdmission.idleObservedAfterMessage
           ) {
             // A persisted prompt proves admission, not completion. OpenCode can
             // still report idle before its session loop starts processing it.
@@ -2192,10 +2194,17 @@ export function makeOpenCodeAdapter(
           if (context.turnTokenUsage) {
             context.turnTokenUsage.complete = false;
           }
-          const admission = context.promptAdmission;
+          // A failed steer advances the generation without replacing the accepted
+          // prompt. Capture this recovery's generation while retaining its identity.
+          const admission =
+            context.promptAdmission ??
+            (context.lastAcceptedPrompt !== undefined &&
+            context.lastAcceptedPrompt.turnId === context.activeTurnId
+              ? { ...context.lastAcceptedPrompt, generation: context.promptGeneration }
+              : undefined);
           yield* schedulePromptAdmissionRecovery(context, event);
           if (admission) {
-            const recoveryFiber = admission.recoveryFiber;
+            const recoveryFiber = context.promptAdmission?.recoveryFiber;
             yield* Effect.gen(function* () {
               if (recoveryFiber) {
                 yield* Fiber.await(recoveryFiber);
@@ -2233,7 +2242,12 @@ export function makeOpenCodeAdapter(
                       type: "runtime.warning",
                       payload: {
                         message: "OpenCode turn completion is waiting for message history.",
-                        detail: openCodeRuntimeErrorDetail(cause),
+                        detail:
+                          cause._tag === "TimeoutError"
+                            ? "timeout"
+                            : isOpenCodeNotFound(cause)
+                              ? "not_found"
+                              : "sdk_request_failed",
                       },
                     });
                   }),
@@ -2391,7 +2405,7 @@ export function makeOpenCodeAdapter(
               if (promptAdmission.recoveryFiber) {
                 yield* Fiber.interrupt(promptAdmission.recoveryFiber);
               }
-              if (idle) {
+              if (idle && promptAdmission.idleObservedAfterMessage) {
                 yield* scheduleIdleReconciliation(context, idle.turnId, idle.raw);
               }
             }
@@ -3079,6 +3093,7 @@ export function makeOpenCodeAdapter(
           pendingRequestRecovery: undefined,
           promptGeneration: 0,
           promptAdmission: undefined,
+          lastAcceptedPrompt: undefined,
           commandFibers: new Set(),
           promptSemaphore: Semaphore.makeUnsafe(1),
           firstConnection: Deferred.makeUnsafe<void, ProviderAdapterRequestError>(),
@@ -3530,6 +3545,10 @@ export function makeOpenCodeAdapter(
             return yield* Effect.interrupt;
           }
           promptAdmission.accepted = true;
+          context.lastAcceptedPrompt = {
+            turnId,
+            messageId,
+          };
           yield* Deferred.succeed(promptAdmission.acceptance, undefined).pipe(Effect.ignore);
           if (
             context.promptAdmission === promptAdmission &&
