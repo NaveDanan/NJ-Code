@@ -104,6 +104,7 @@ const runtimeMock = {
     closeError: null as Error | null,
     messages: [] as MessageEntry[],
     messagesImplementation: null as ((signal?: AbortSignal) => Promise<MessageEntry[]>) | null,
+    messageImplementation: null as ((messageID: string) => Promise<MessageEntry>) | null,
     forkMessagesBySession: new Map<string, MessageEntry[]>(),
     forkPreservesBoundary: true,
     subscribedEvents: [] as Array<unknown | Promise<unknown>>,
@@ -169,6 +170,7 @@ const runtimeMock = {
     this.state.closeError = null;
     this.state.messages = [];
     this.state.messagesImplementation = null;
+    this.state.messageImplementation = null;
     this.state.forkMessagesBySession.clear();
     this.state.forkPreservesBoundary = true;
     this.state.subscribedEvents = [];
@@ -421,6 +423,9 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
         },
         message: async ({ sessionID, messageID }: { sessionID: string; messageID: string }) => {
           runtimeMock.state.messageCalls.push({ sessionID, messageID });
+          if (runtimeMock.state.messageImplementation) {
+            return { data: await runtimeMock.state.messageImplementation(messageID) };
+          }
           if (runtimeMock.state.messageFailures > 0) {
             runtimeMock.state.messageFailures -= 1;
             throw new Error("message lookup failed", { cause: { status: 500 } });
@@ -8052,6 +8057,101 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       );
       yield* adapter.stopSession(threadId);
     }),
+  );
+
+  it.effect.each([
+    { receipt: "live", reply: "current" },
+    { receipt: "sdk", reply: "current" },
+    { receipt: "live", reply: "none" },
+    { receipt: "sdk", reply: "none" },
+    { receipt: "live", reply: "earlier" },
+    { receipt: "sdk", reply: "earlier" },
+  ] as const)(
+    "recovers idle before a delayed prompt receipt ($receipt, $reply)",
+    ({ receipt, reply }) =>
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        const threadId = asThreadId(`thread-delayed-receipt-${receipt}-${reply}`);
+        const sessionID = "http://127.0.0.1:9999/session";
+        const publish = makeOpenCodeEventQueue();
+        const receiptStarted = promiseWithResolvers<void>();
+        const receiptRelease = promiseWithResolvers<MessageEntry>();
+        runtimeMock.state.autoPromptEcho = false;
+        runtimeMock.state.sessionStatus = "idle";
+        runtimeMock.state.messageImplementation = async () => {
+          receiptStarted.resolve(undefined);
+          return await receiptRelease.promise;
+        };
+        yield* adapter.startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          runtimeMode: "full-access",
+        });
+        const turn = yield* adapter.sendTurn({
+          threadId,
+          input: "Work",
+          modelSelection: createModelSelection(ProviderInstanceId.make("opencode"), "openai/gpt-5"),
+        });
+        yield* Effect.promise(() => receiptStarted.promise);
+        const prompt = runtimeMock.state.promptCalls[0] as { messageID: string };
+        const user: MessageEntry = { info: { id: prompt.messageID, role: "user" }, parts: [] };
+        runtimeMock.state.messages.push(user);
+        if (reply !== "none") {
+          runtimeMock.state.messages.push({
+            info: {
+              id: "msg-finished-before-echo",
+              role: "assistant",
+              parentID: reply === "current" ? prompt.messageID : "msg-earlier-prompt",
+            },
+            parts: [],
+          });
+        }
+        const idleHandled = yield* adapter.streamEvents.pipe(
+          Stream.filter(
+            (event) => event.threadId === threadId && event.type === "thread.state.changed",
+          ),
+          Stream.runHead,
+          Effect.forkChild,
+        );
+        publish({ type: "session.status", properties: { sessionID, status: { type: "idle" } } });
+        publish({ type: "session.compacted", properties: { sessionID } });
+        yield* Fiber.join(idleHandled);
+        const echoHandled = yield* Deferred.make<void>();
+        const completionFiber = yield* adapter.streamEvents.pipe(
+          Stream.tap((event) =>
+            event.threadId === threadId && event.type === "thread.state.changed"
+              ? Deferred.succeed(echoHandled, undefined)
+              : Effect.void,
+          ),
+          Stream.filter((event) => event.threadId === threadId && event.type === "turn.completed"),
+          Stream.runHead,
+          Effect.forkChild,
+        );
+        if (receipt === "live") {
+          publish({ type: "message.updated", properties: { sessionID, info: user.info } });
+          publish({ type: "session.compacted", properties: { sessionID } });
+          yield* Deferred.await(echoHandled);
+        }
+        receiptRelease.resolve(user);
+        yield* advanceTestClock(10_000);
+        const session = (yield* adapter.listSessions()).find(
+          (entry) => entry.threadId === threadId,
+        );
+        if (reply === "current") {
+          NodeAssert.notEqual(completionFiber.pollUnsafe(), undefined);
+          NodeAssert.equal(session?.status, "ready");
+        } else {
+          NodeAssert.equal(completionFiber.pollUnsafe(), undefined);
+          NodeAssert.equal(session?.status, "running");
+          NodeAssert.equal(session?.activeTurnId, turn.turnId);
+          publish({ type: "session.status", properties: { sessionID, status: { type: "idle" } } });
+        }
+        const completed = Option.getOrThrow(yield* Fiber.join(completionFiber));
+        NodeAssert.equal(completed.turnId, turn.turnId);
+        NodeAssert.ok(completed.type === "turn.completed");
+        NodeAssert.equal(completed.payload.state, "completed");
+        yield* adapter.stopSession(threadId);
+      }),
   );
 
   it.effect.each([

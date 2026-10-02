@@ -1440,6 +1440,12 @@ export function makeOpenCodeAdapter(
             // still report idle before its session loop starts processing it.
             context.promptAdmission = undefined;
             context.awaitingBusyAfterInterruption = false;
+            const idle = promptAdmission.idleDuringAdmission ?? promptAdmission.priorIdle;
+            if (idle) {
+              yield* recoverPromptCompletion(context, promptAdmission, idle.raw).pipe(
+                Effect.forkIn(context.sessionScope),
+              );
+            }
             return;
           }
 
@@ -2178,6 +2184,88 @@ export function makeOpenCodeAdapter(
       yield* run.pipe(Effect.forkIn(context.sessionScope));
     });
 
+    const recoverPromptCompletion = Effect.fn("recoverPromptCompletion")(
+      function* (
+        context: OpenCodeSessionContext,
+        prompt: Pick<OpenCodePromptAdmission, "turnId" | "generation">,
+        raw: unknown,
+      ) {
+        // Admission can settle on a different accepted prompt after a failed
+        // steer. Use its current identity with the captured generation.
+        if (context.lastAcceptedPrompt?.turnId !== prompt.turnId) {
+          return;
+        }
+        const isCurrentPrompt = () =>
+          context.activeTurnId === prompt.turnId &&
+          context.promptGeneration === prompt.generation &&
+          context.promptAdmission === undefined;
+        if (!isCurrentPrompt()) {
+          return;
+        }
+        let warned = false;
+        // A user message alone can precede the session loop. An assistant
+        // reply proves this prompt started, so idle can recover a missed completion.
+        const response = yield* Effect.gen(function* () {
+          if (!isCurrentPrompt()) {
+            return yield* Effect.interrupt;
+          }
+          return yield* runOpenCodeSdk("session.messages", (signal) =>
+            context.client.session.messages(
+              { sessionID: context.openCodeSessionId, limit: 1 },
+              { signal },
+            ),
+          ).pipe(Effect.timeout("1 second"), Effect.retry({ times: 1 }));
+        }).pipe(
+          Effect.tapError((cause) =>
+            Effect.gen(function* () {
+              if (warned || !isCurrentPrompt()) return;
+              warned = true;
+              yield* emit({
+                ...(yield* buildEventBase({
+                  threadId: context.session.threadId,
+                  turnId: prompt.turnId,
+                })),
+                type: "runtime.warning",
+                payload: {
+                  message: "OpenCode turn completion is waiting for message history.",
+                  detail:
+                    cause._tag === "TimeoutError"
+                      ? "timeout"
+                      : isOpenCodeNotFound(cause)
+                        ? "not_found"
+                        : "sdk_request_failed",
+                },
+              });
+            }),
+          ),
+          Effect.retry({
+            while: isCurrentPrompt,
+            schedule: Schedule.min([
+              Schedule.exponential("250 millis"),
+              Schedule.spaced("5 seconds"),
+            ]),
+          }),
+        );
+        const message = response.data?.at(-1)?.info;
+        const parentMessageId = message?.role === "assistant" ? message.parentID : undefined;
+        let acceptedPrompt: OpenCodeAcceptedPrompt | undefined = context.lastAcceptedPrompt;
+        // Failed native steers can leave the prior prompt running. Stop
+        // at any newer command that still awaits its own reply.
+        while (acceptedPrompt?.failed && acceptedPrompt.messageId !== parentMessageId) {
+          acceptedPrompt = acceptedPrompt.previous;
+        }
+        if (
+          message?.role === "assistant" &&
+          acceptedPrompt?.turnId === prompt.turnId &&
+          message.parentID === acceptedPrompt.messageId &&
+          isCurrentPrompt()
+        ) {
+          yield* scheduleIdleReconciliation(context, prompt.turnId, raw);
+        }
+      },
+      Effect.ignore({ log: true }),
+    );
+
     const handleSubscribedEvent = Effect.fn("handleSubscribedEvent")(function* (
       context: OpenCodeSessionContext,
       event: OpenCodeSubscribedEvent,
@@ -2223,79 +2311,8 @@ export function makeOpenCodeAdapter(
               if (recoveryFiber) {
                 yield* Fiber.await(recoveryFiber);
               }
-              // A steer can fail while reconnect waits for admission. Recover
-              // the prompt that was accepted, using the captured generation.
-              if (context.lastAcceptedPrompt?.turnId !== admission.turnId) {
-                return;
-              }
-              const isCurrentPrompt = () =>
-                context.activeTurnId === admission.turnId &&
-                context.promptGeneration === admission.generation &&
-                context.promptAdmission === undefined;
-              if (!isCurrentPrompt()) {
-                return;
-              }
-              let warned = false;
-              // A user message alone can precede the session loop. An assistant
-              // reply proves this prompt started, so idle can recover a missed completion.
-              const response = yield* Effect.gen(function* () {
-                if (!isCurrentPrompt()) {
-                  return yield* Effect.interrupt;
-                }
-                return yield* runOpenCodeSdk("session.messages", (signal) =>
-                  context.client.session.messages(
-                    { sessionID: context.openCodeSessionId, limit: 1 },
-                    { signal },
-                  ),
-                ).pipe(Effect.timeout("1 second"), Effect.retry({ times: 1 }));
-              }).pipe(
-                Effect.tapError((cause) =>
-                  Effect.gen(function* () {
-                    if (warned || !isCurrentPrompt()) return;
-                    warned = true;
-                    yield* emit({
-                      ...(yield* buildEventBase({
-                        threadId: context.session.threadId,
-                        turnId: admission.turnId,
-                      })),
-                      type: "runtime.warning",
-                      payload: {
-                        message: "OpenCode turn completion is waiting for message history.",
-                        detail:
-                          cause._tag === "TimeoutError"
-                            ? "timeout"
-                            : isOpenCodeNotFound(cause)
-                              ? "not_found"
-                              : "sdk_request_failed",
-                      },
-                    });
-                  }),
-                ),
-                Effect.retry({
-                  while: isCurrentPrompt,
-                  schedule: Schedule.min([
-                    Schedule.exponential("250 millis"),
-                    Schedule.spaced("5 seconds"),
-                  ]),
-                }),
-              );
-              const message = response.data?.at(-1)?.info;
-              const parentMessageId = message?.role === "assistant" ? message.parentID : undefined;
-              let acceptedPrompt: OpenCodeAcceptedPrompt | undefined = context.lastAcceptedPrompt;
-              // Failed native steers can leave the prior prompt running. Stop
-              // at any newer command that still awaits its own reply.
-              while (acceptedPrompt?.failed && acceptedPrompt.messageId !== parentMessageId) {
-                acceptedPrompt = acceptedPrompt.previous;
-              }
-              if (
-                message?.role === "assistant" &&
-                acceptedPrompt?.turnId === admission.turnId &&
-                message.parentID === acceptedPrompt.messageId &&
-                isCurrentPrompt()
-              ) {
-                yield* scheduleIdleReconciliation(context, admission.turnId, event);
-              }
-            }).pipe(Effect.ignore({ log: true }), Effect.forkIn(context.sessionScope));
+              yield* recoverPromptCompletion(context, admission, event);
+            }).pipe(Effect.forkIn(context.sessionScope));
           } else if (context.activeTurnId !== undefined) {
             yield* scheduleIdleReconciliation(context, context.activeTurnId, event);
           }
@@ -2426,7 +2443,7 @@ export function makeOpenCodeAdapter(
             promptAdmission.messageObserved = true;
             yield* Deferred.succeed(promptAdmission.messageReceipt, undefined);
             if (promptAdmission.accepted) {
-              const idle = promptAdmission.idleDuringAdmission;
+              const idle = promptAdmission.idleDuringAdmission ?? promptAdmission.priorIdle;
               context.awaitingBusyAfterInterruption = false;
               context.promptAdmission = undefined;
               if (promptAdmission.recoveryFiber) {
@@ -2434,6 +2451,10 @@ export function makeOpenCodeAdapter(
               }
               if (idle && promptAdmission.idleObservedAfterMessage) {
                 yield* scheduleIdleReconciliation(context, idle.turnId, idle.raw);
+              } else if (idle) {
+                yield* recoverPromptCompletion(context, promptAdmission, idle.raw).pipe(
+                  Effect.forkIn(context.sessionScope),
+                );
               }
             }
           }
