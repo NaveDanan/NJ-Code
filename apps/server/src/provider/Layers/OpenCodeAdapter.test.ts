@@ -1722,6 +1722,159 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     );
   }
 
+  it.effect.each([
+    { lookupPending: false, commandReply: false, sequence: "single" },
+    { lookupPending: true, commandReply: false, sequence: "single" },
+    { lookupPending: false, commandReply: true, sequence: "single" },
+    { lookupPending: true, commandReply: true, sequence: "single" },
+    { lookupPending: false, commandReply: false, sequence: "rejected prompt" },
+    { lookupPending: false, commandReply: false, sequence: "earlier command fails first" },
+    { lookupPending: true, commandReply: false, sequence: "later command fails first" },
+  ] as const)(
+    "recovers after an accepted native steer fails ($sequence, lookup pending: $lookupPending, command reply: $commandReply)",
+    ({ lookupPending, commandReply, sequence }) =>
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        const threadId = asThreadId(`thread-native-steer-failure-${lookupPending}`);
+        const sessionID = "http://127.0.0.1:9999/session";
+        const publish = makeOpenCodeEventQueue();
+        const commandCompletion = promiseWithResolvers<void>();
+        const laterCommandCompletion = promiseWithResolvers<void>();
+        let historyStarted = promiseWithResolvers<void>();
+        const historyRelease = promiseWithResolvers<void>();
+        const modelSelection = createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "openai/gpt-5",
+        );
+        runtimeMock.state.commandImplementation = async (input) => {
+          publish({
+            type: "message.updated",
+            properties: {
+              sessionID: input.sessionID,
+              info: { id: input.messageID, role: "user" },
+            },
+          });
+          await (runtimeMock.state.commandCalls.length === 1
+            ? commandCompletion.promise
+            : laterCommandCompletion.promise);
+        };
+        yield* adapter.startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          runtimeMode: "full-access",
+        });
+        const original = yield* adapter.sendTurn({ threadId, input: "Work", modelSelection });
+        yield* adapter.sendTurn({ threadId, input: "/review", modelSelection });
+        if (sequence === "rejected prompt") {
+          runtimeMock.state.promptAsyncError = new Error("ordinary steer rejected");
+          NodeAssert.equal(
+            Exit.isFailure(
+              yield* adapter
+                .sendTurn({ threadId, input: "More work", modelSelection })
+                .pipe(Effect.exit),
+            ),
+            true,
+          );
+          runtimeMock.state.promptAsyncError = null;
+        } else if (sequence.endsWith("command fails first")) {
+          yield* adapter.sendTurn({ threadId, input: "/review", modelSelection });
+        }
+        const prompt = runtimeMock.state.promptCalls[0] as { messageID: string };
+        runtimeMock.state.messages.push({
+          info: {
+            id: "msg-original-completed",
+            role: "assistant",
+            parentID: commandReply
+              ? (runtimeMock.state.commandCalls[0]?.messageID as string)
+              : prompt.messageID,
+          },
+          parts: [],
+        });
+        runtimeMock.state.messagesImplementation = async () => {
+          const messages = [...runtimeMock.state.messages];
+          historyStarted.resolve(undefined);
+          if (lookupPending) await historyRelease.promise;
+          return messages;
+        };
+        const warning = yield* Deferred.make<void>();
+        const secondWarning = yield* Deferred.make<void>();
+        let warningCount = 0;
+        let reconnectHandled = yield* Deferred.make<void>();
+        const completionFiber = yield* adapter.streamEvents.pipe(
+          Stream.tap((event) =>
+            event.threadId === threadId && event.type === "thread.state.changed"
+              ? Deferred.succeed(reconnectHandled, undefined)
+              : Effect.void,
+          ),
+          Stream.tap((event) =>
+            event.threadId === threadId &&
+            event.type === "runtime.warning" &&
+            event.payload.message === "OpenCode /review failed after it was accepted."
+              ? Deferred.succeed(++warningCount === 1 ? warning : secondWarning, undefined)
+              : Effect.void,
+          ),
+          Stream.filter(
+            (event) =>
+              event.threadId === threadId &&
+              event.type === "turn.completed" &&
+              event.payload.state === "completed",
+          ),
+          Stream.runHead,
+          Effect.forkChild,
+        );
+        if (lookupPending) {
+          publish({ type: "server.connected", properties: {} });
+          yield* Effect.promise(() => historyStarted.promise);
+        }
+        const laterFailsFirst = sequence === "later command fails first";
+        (laterFailsFirst ? laterCommandCompletion : commandCompletion).reject(
+          new Error("native steer rejected after receipt"),
+        );
+        yield* Deferred.await(warning);
+        runtimeMock.state.sessionStatus = "idle";
+        if (sequence === "earlier command fails first") {
+          publish({ type: "server.connected", properties: {} });
+          publish({ type: "session.compacted", properties: { sessionID } });
+          yield* Deferred.await(reconnectHandled);
+          yield* Effect.promise(() => historyStarted.promise);
+          yield* TestClock.adjust("0 millis");
+          NodeAssert.equal(completionFiber.pollUnsafe(), undefined);
+          NodeAssert.equal(
+            (yield* adapter.listSessions()).find((entry) => entry.threadId === threadId)?.status,
+            "running",
+          );
+          historyStarted = promiseWithResolvers<void>();
+          reconnectHandled = yield* Deferred.make<void>();
+        }
+        if (sequence.endsWith("command fails first")) {
+          (laterFailsFirst ? commandCompletion : laterCommandCompletion).reject(
+            new Error("other native steer rejected after receipt"),
+          );
+          yield* Deferred.await(secondWarning);
+        }
+        if (lookupPending) {
+          historyRelease.resolve(undefined);
+        } else {
+          publish({ type: "server.connected", properties: {} });
+          yield* Effect.promise(() => historyStarted.promise);
+        }
+        publish({ type: "session.compacted", properties: { sessionID } });
+        yield* Deferred.await(reconnectHandled);
+        yield* TestClock.adjust("0 millis");
+        NodeAssert.notEqual(completionFiber.pollUnsafe(), undefined);
+        NodeAssert.equal(
+          Option.getOrThrow(yield* Fiber.join(completionFiber)).turnId,
+          original.turnId,
+        );
+        const session = (yield* adapter.listSessions()).find(
+          (entry) => entry.threadId === threadId,
+        );
+        NodeAssert.equal(session?.status, "ready");
+        NodeAssert.equal(session?.activeTurnId, undefined);
+        yield* adapter.stopSession(threadId);
+      }),
+  );
+
   it.effect("surfaces native command rejection and leaves the session ready", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
@@ -7903,6 +8056,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
 
   it.effect.each([
     { scenario: "missed completion", reply: "current", status: "idle", echo: false },
+    { scenario: "busy before acceptance", reply: "current", status: "idle", echo: false },
     { scenario: "prompt echo before acceptance", reply: "current", status: "idle", echo: true },
     { scenario: "ongoing work", reply: "current", status: "busy", echo: false },
     { scenario: "prompt not started", reply: "none", status: "idle", echo: false },
@@ -7911,6 +8065,30 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       scenario: "rejected steer before second reconnect",
       reply: "none",
       status: "idle",
+      echo: false,
+    },
+    {
+      scenario: "reconnect during rejected steer with missed completion",
+      reply: "current",
+      status: "busy",
+      echo: false,
+    },
+    {
+      scenario: "reconnect during rejected steer before processing",
+      reply: "none",
+      status: "idle",
+      echo: false,
+    },
+    {
+      scenario: "reconnect during rejected steer with an earlier reply",
+      reply: "earlier",
+      status: "idle",
+      echo: false,
+    },
+    {
+      scenario: "reconnect during accepted steer before processing",
+      reply: "current",
+      status: "busy",
       echo: false,
     },
     {
@@ -7956,6 +8134,22 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
           })
           .pipe(Effect.forkChild);
         yield* Effect.promise(() => promptStarted.promise);
+
+        if (scenario === "busy before acceptance") {
+          const busyHandled = yield* adapter.streamEvents.pipe(
+            Stream.filter(
+              (event) => event.threadId === threadId && event.type === "thread.state.changed",
+            ),
+            Stream.runHead,
+            Effect.forkChild,
+          );
+          enqueue({
+            type: "session.status",
+            properties: { sessionID, status: { type: "busy" } },
+          });
+          enqueue({ type: "session.compacted", properties: { sessionID } });
+          yield* Fiber.join(busyHandled);
+        }
 
         const warningFiber = yield* adapter.streamEvents.pipe(
           Stream.filter((event) => event.threadId === threadId && event.type === "runtime.warning"),
@@ -8036,13 +8230,28 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
             (event) =>
               event.threadId === threadId &&
               event.type === "turn.completed" &&
-              event.payload.state === "completed",
+              (event.payload.state === "completed" || scenario === "busy before acceptance"),
           ),
           Stream.runHead,
           Effect.forkChild,
         );
         promptRelease.resolve(undefined);
         const turn = yield* Fiber.join(turnFiber);
+        if (scenario === "busy before acceptance") {
+          yield* advanceTestClock(10_000);
+          const completed = Option.getOrThrow(yield* Fiber.join(completedFiber));
+          NodeAssert.equal(completed.type, "turn.completed");
+          if (completed.type === "turn.completed") {
+            NodeAssert.equal(completed.payload.state, "completed");
+          }
+          NodeAssert.equal(completed.turnId, turn.turnId);
+          NodeAssert.equal(
+            (yield* adapter.listSessions()).find((entry) => entry.threadId === threadId)?.status,
+            "ready",
+          );
+          yield* adapter.stopSession(threadId);
+          return;
+        }
         if (scenario === "message lookup failures") {
           NodeAssert.equal(yield* Deferred.await(recoveryWarning), "sdk_request_failed");
           yield* advanceTestClock(250);
@@ -8094,6 +8303,75 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
               currentTurn.turnId,
             );
           }
+          return;
+        }
+
+        if (scenario.startsWith("reconnect during ")) {
+          yield* TestClock.adjust("0 millis");
+          const steerStarted = promiseWithResolvers<void>();
+          const steerRelease = promiseWithResolvers<void>();
+          const steerHistoryRead = promiseWithResolvers<void>();
+          const rejectSteer = scenario.includes("rejected steer");
+          runtimeMock.state.messagesImplementation = async () => {
+            steerHistoryRead.resolve(undefined);
+            return [...runtimeMock.state.messages];
+          };
+          runtimeMock.state.promptAsyncImplementation = async () => {
+            if (!rejectSteer) {
+              const steer = runtimeMock.state.promptCalls.at(-1) as { messageID: string };
+              runtimeMock.state.messages.push({
+                info: { id: steer.messageID, role: "user" },
+                parts: [],
+              });
+            }
+            steerStarted.resolve(undefined);
+            await steerRelease.promise;
+            if (rejectSteer) throw new Error("steer rejected during reconnect");
+          };
+          const steerFiber = yield* adapter
+            .sendTurn({
+              threadId,
+              input: "More work",
+              modelSelection: createModelSelection(
+                ProviderInstanceId.make("opencode"),
+                "opencode/kimi-k3",
+              ),
+            })
+            .pipe(Effect.exit, Effect.forkChild);
+          yield* Effect.promise(() => steerStarted.promise);
+          runtimeMock.state.sessionStatus = "idle";
+          enqueue({ type: "server.connected", properties: {} });
+          enqueue({ type: "session.compacted", properties: { sessionID } });
+          yield* Deferred.await(secondReconnectHandled);
+          steerRelease.resolve(undefined);
+          NodeAssert.equal(Exit.isFailure(yield* Fiber.join(steerFiber)), rejectSteer);
+          yield* Effect.promise(() => steerHistoryRead.promise);
+          yield* TestClock.adjust("0 millis");
+          const session = (yield* adapter.listSessions()).find(
+            (entry) => entry.threadId === threadId,
+          );
+          if (reply === "current" && rejectSteer) {
+            NodeAssert.equal(session?.status, "ready");
+          } else {
+            NodeAssert.equal(session?.status, "running");
+            NodeAssert.equal(session?.activeTurnId, turn.turnId);
+            NodeAssert.equal(completedFiber.pollUnsafe(), undefined);
+            runtimeMock.state.messages.push({
+              info: {
+                id: "msg-completed-after-reconnect-steer",
+                role: "assistant",
+                parentID: rejectSteer
+                  ? prompt.messageID
+                  : (runtimeMock.state.promptCalls.at(-1) as { messageID: string }).messageID,
+              },
+              parts: [],
+            });
+            enqueue({ type: "server.connected", properties: {} });
+          }
+          NodeAssert.equal(
+            Option.getOrThrow(yield* Fiber.join(completedFiber)).turnId,
+            turn.turnId,
+          );
           return;
         }
 

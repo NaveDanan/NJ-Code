@@ -336,6 +336,13 @@ type OpenCodeTextPartState = Pick<OpenCodeTextPart, "id" | "messageID" | "type" 
 
 type OpenCodeStepUsage = Pick<Extract<Part, { readonly type: "step-finish" }>, "id" | "tokens">;
 
+interface OpenCodeAcceptedPrompt {
+  readonly turnId: TurnId;
+  readonly messageId: string;
+  readonly previous: OpenCodeAcceptedPrompt | undefined;
+  failed: boolean;
+}
+
 interface OpenCodeSessionContext {
   session: ProviderSession;
   readonly client: OpencodeClient;
@@ -365,7 +372,7 @@ interface OpenCodeSessionContext {
   pendingRequestRecovery: OpenCodePendingRequestRecovery | undefined;
   promptGeneration: number;
   promptAdmission: OpenCodePromptAdmission | undefined;
-  lastAcceptedPrompt: Pick<OpenCodePromptAdmission, "turnId" | "messageId"> | undefined;
+  lastAcceptedPrompt: OpenCodeAcceptedPrompt | undefined;
   readonly commandFibers: Set<Fiber.Fiber<void, ProviderAdapterRequestError>>;
   readonly promptSemaphore: Semaphore.Semaphore;
   readonly firstConnection: Deferred.Deferred<void, ProviderAdapterRequestError>;
@@ -1465,6 +1472,13 @@ export function makeOpenCodeAdapter(
           }
 
           const idle = promptAdmission.idleDuringAdmission ?? promptAdmission.priorIdle;
+          if (promptAdmission.messageObserved && idle === undefined) {
+            // Release admission after a lost idle event. Reconnect recovery
+            // still requires an assistant reply before checking completion.
+            context.promptAdmission = undefined;
+            context.awaitingBusyAfterInterruption = false;
+            return;
+          }
           if (
             isIdle &&
             idle !== undefined &&
@@ -2209,6 +2223,11 @@ export function makeOpenCodeAdapter(
               if (recoveryFiber) {
                 yield* Fiber.await(recoveryFiber);
               }
+              // A steer can fail while reconnect waits for admission. Recover
+              // the prompt that was accepted, using the captured generation.
+              if (context.lastAcceptedPrompt?.turnId !== admission.turnId) {
+                return;
+              }
               const isCurrentPrompt = () =>
                 context.activeTurnId === admission.turnId &&
                 context.promptGeneration === admission.generation &&
@@ -2261,9 +2280,17 @@ export function makeOpenCodeAdapter(
                 }),
               );
               const message = response.data?.at(-1)?.info;
+              const parentMessageId = message?.role === "assistant" ? message.parentID : undefined;
+              let acceptedPrompt: OpenCodeAcceptedPrompt | undefined = context.lastAcceptedPrompt;
+              // Failed native steers can leave the prior prompt running. Stop
+              // at any newer command that still awaits its own reply.
+              while (acceptedPrompt?.failed && acceptedPrompt.messageId !== parentMessageId) {
+                acceptedPrompt = acceptedPrompt.previous;
+              }
               if (
                 message?.role === "assistant" &&
-                message.parentID === admission.messageId &&
+                acceptedPrompt?.turnId === admission.turnId &&
+                message.parentID === acceptedPrompt.messageId &&
                 isCurrentPrompt()
               ) {
                 yield* scheduleIdleReconciliation(context, admission.turnId, event);
@@ -3230,6 +3257,16 @@ export function makeOpenCodeAdapter(
           // prompt into the running session, so the active turn id is reused.
           const steeringTurnId = context.activeTurnId;
           const turnId = steeringTurnId ?? freshTurnId;
+          const priorAcceptedPrompt = context.lastAcceptedPrompt;
+          const acceptedPrompt: OpenCodeAcceptedPrompt = {
+            turnId,
+            messageId,
+            previous:
+              nativeCommand && priorAcceptedPrompt?.turnId === turnId
+                ? priorAcceptedPrompt
+                : undefined,
+            failed: false,
+          };
           const agent = getModelSelectionStringOptionValue(modelSelection, "agent");
           const variant = getModelSelectionStringOptionValue(modelSelection, "variant");
           const pendingIdleReconciliation = context.pendingIdleReconciliation;
@@ -3389,6 +3426,12 @@ export function makeOpenCodeAdapter(
                   context.promptGeneration !== promptAdmission.generation)
               ) {
                 return Effect.gen(function* () {
+                  // Update this command's receipt even if another steer advanced
+                  // the generation; never replace a newer accepted prompt.
+                  acceptedPrompt.failed = true;
+                  if (context.promptAdmission === promptAdmission) {
+                    context.promptAdmission = undefined;
+                  }
                   yield* emit({
                     ...(yield* buildEventBase({ threadId: input.threadId, turnId })),
                     type: "runtime.warning",
@@ -3545,10 +3588,7 @@ export function makeOpenCodeAdapter(
             return yield* Effect.interrupt;
           }
           promptAdmission.accepted = true;
-          context.lastAcceptedPrompt = {
-            turnId,
-            messageId,
-          };
+          context.lastAcceptedPrompt = acceptedPrompt;
           yield* Deferred.succeed(promptAdmission.acceptance, undefined).pipe(Effect.ignore);
           if (
             context.promptAdmission === promptAdmission &&
